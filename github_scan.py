@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
+import hmac
+import io
 import json
 import re
+import secrets
 import sys
 import time
 from dataclasses import dataclass
@@ -14,6 +18,8 @@ from typing import Any
 from urllib import error, parse, request
 
 API_BASE = "https://api.github.com"
+ENC_MAGIC = "GITHUB_SCAN_ENC_V1"
+PBKDF2_ITERATIONS = 200_000
 TECH_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("django", "Django"),
     ("fastapi", "FastAPI"),
@@ -59,9 +65,107 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def load_credentials(csv_path: Path) -> list[tuple[str, str]]:
+def xor_with_keystream(data: bytes, key: bytes, nonce: bytes) -> bytes:
+    # Deterministic stream for symmetric encrypt/decrypt from key+nonce.
+    out = bytearray(len(data))
+    offset = 0
+    counter = 0
+    while offset < len(data):
+        block = hashlib.sha256(key + nonce + counter.to_bytes(8, "big")).digest()
+        block_len = min(len(block), len(data) - offset)
+        for index in range(block_len):
+            out[offset + index] = data[offset + index] ^ block[index]
+        offset += block_len
+        counter += 1
+    return bytes(out)
+
+
+def derive_keys(passphrase: str, salt: bytes, iterations: int) -> tuple[bytes, bytes]:
+    if not passphrase:
+        raise ValueError("Encryption key must not be empty.")
+
+    key_material = hashlib.pbkdf2_hmac(
+        "sha256",
+        passphrase.encode("utf-8"),
+        salt,
+        iterations,
+        dklen=64,
+    )
+    return key_material[:32], key_material[32:]
+
+
+def build_mac(mac_key: bytes, salt: bytes, nonce: bytes, iterations: int, ciphertext: bytes) -> str:
+    payload = (
+        ENC_MAGIC.encode("ascii")
+        + b"\n"
+        + salt
+        + nonce
+        + iterations.to_bytes(8, "big")
+        + ciphertext
+    )
+    return hmac.new(mac_key, payload, hashlib.sha256).hexdigest()
+
+
+def encrypt_text(plaintext: str, passphrase: str) -> bytes:
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+    enc_key, mac_key = derive_keys(passphrase, salt, PBKDF2_ITERATIONS)
+
+    ciphertext = xor_with_keystream(plaintext.encode("utf-8"), enc_key, nonce)
+    mac = build_mac(mac_key, salt, nonce, PBKDF2_ITERATIONS, ciphertext)
+
+    envelope = {
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "iterations": PBKDF2_ITERATIONS,
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "mac": mac,
+    }
+    return (ENC_MAGIC + "\n" + json.dumps(envelope, separators=(",", ":"))).encode("utf-8")
+
+
+def decrypt_text(blob: bytes, passphrase: str) -> str:
+    try:
+        prefix, payload = blob.split(b"\n", 1)
+    except ValueError as exc:
+        raise ValueError("Encrypted file format is invalid.") from exc
+
+    if prefix.decode("utf-8", errors="replace") != ENC_MAGIC:
+        raise ValueError("Input file is not in supported encrypted format.")
+
+    try:
+        envelope = json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Encrypted file payload is not valid JSON.") from exc
+
+    try:
+        salt = base64.b64decode(str(envelope["salt"]))
+        nonce = base64.b64decode(str(envelope["nonce"]))
+        ciphertext = base64.b64decode(str(envelope["ciphertext"]))
+        iterations = int(envelope["iterations"])
+        provided_mac = str(envelope["mac"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError("Encrypted file is missing required fields.") from exc
+
+    enc_key, mac_key = derive_keys(passphrase, salt, iterations)
+    expected_mac = build_mac(mac_key, salt, nonce, iterations, ciphertext)
+    if not hmac.compare_digest(expected_mac, provided_mac):
+        raise ValueError("Failed to decrypt key file: wrong decrypt key or corrupted file.")
+
+    plaintext = xor_with_keystream(ciphertext, enc_key, nonce)
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Decrypted key file is not valid UTF-8 text.") from exc
+
+
+def is_encrypted_blob(blob: bytes) -> bool:
+    return blob.startswith((ENC_MAGIC + "\n").encode("ascii"))
+
+
+def load_credentials_from_text(csv_text: str) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
-    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+    with io.StringIO(csv_text) as handle:
         reader = csv.reader(handle)
         for index, row in enumerate(reader, start=1):
             if not row:
@@ -80,6 +184,45 @@ def load_credentials(csv_path: Path) -> list[tuple[str, str]]:
     if not rows:
         raise ValueError("No credentials found in input CSV.")
     return rows
+
+
+def load_credentials(csv_path: Path, decrypt_key: str | None) -> list[tuple[str, str]]:
+    raw = csv_path.read_bytes()
+    if is_encrypted_blob(raw):
+        if not decrypt_key:
+            raise ValueError("Input key file is encrypted. Provide --decrypt-key to continue.")
+        csv_text = decrypt_text(raw, decrypt_key)
+    else:
+        csv_text = raw.decode("utf-8-sig")
+
+    return load_credentials_from_text(csv_text)
+
+
+def encrypt_credentials_file(input_path: Path, output_path: Path, encrypt_key: str) -> None:
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {input_path}")
+
+    raw = input_path.read_bytes()
+    if is_encrypted_blob(raw):
+        raise ValueError("Input file is already encrypted.")
+
+    plaintext = raw.decode("utf-8-sig")
+    encrypted = encrypt_text(plaintext, encrypt_key)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(encrypted)
+
+
+def export_decrypted_file(input_path: Path, output_path: Path, decrypt_key: str) -> None:
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {input_path}")
+
+    raw = input_path.read_bytes()
+    if not is_encrypted_blob(raw):
+        raise ValueError("Input file is not encrypted.")
+
+    plaintext = decrypt_text(raw, decrypt_key)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(plaintext, encoding="utf-8")
 
 
 def github_get_json(url: str, token: str, timeout: int, accept: str = "application/vnd.github+json") -> Any:
@@ -491,8 +634,8 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
     write_project_summaries(all_repos, output_dir)
 
 
-def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: float) -> int:
-    credentials = load_credentials(input_path)
+def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: float, decrypt_key: str | None) -> int:
+    credentials = load_credentials(input_path, decrypt_key)
     results: list[AccountResult] = []
 
     for index, (csv_owner, token) in enumerate(credentials, start=1):
@@ -586,6 +729,23 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Delay in seconds between scanning each account.",
     )
+    parser.add_argument("--decrypt-key", default=None, help="Decrypt key for encrypted key file input.")
+    parser.add_argument("--encrypt-key", default=None, help="User-defined key used to encrypt key file.")
+    parser.add_argument(
+        "--encrypt-input",
+        action="store_true",
+        help="Encrypt --input file and exit without scanning.",
+    )
+    parser.add_argument(
+        "--encrypted-output",
+        default=None,
+        help="Output path for encrypted key file (default: <input>.enc).",
+    )
+    parser.add_argument(
+        "--export-decrypted",
+        default=None,
+        help="Write decrypted key file to this path and exit.",
+    )
     return parser.parse_args()
 
 
@@ -594,16 +754,32 @@ def main() -> int:
     input_path = Path(args.input)
     output_dir = Path(args.output_dir)
 
-    if not input_path.exists():
-        print(f"Input file not found: {input_path}", file=sys.stderr)
-        return 2
-
     try:
+        if args.encrypt_input:
+            if not args.encrypt_key:
+                raise ValueError("--encrypt-input requires --encrypt-key.")
+            encrypted_output = Path(args.encrypted_output) if args.encrypted_output else Path(str(input_path) + ".enc")
+            encrypt_credentials_file(input_path, encrypted_output, args.encrypt_key)
+            print(f"Encrypted key file written to: {encrypted_output}")
+            return 0
+
+        if args.export_decrypted:
+            if not args.decrypt_key:
+                raise ValueError("--export-decrypted requires --decrypt-key.")
+            export_decrypted_file(input_path, Path(args.export_decrypted), args.decrypt_key)
+            print(f"Decrypted key file written to: {args.export_decrypted}")
+            return 0
+
+        if not input_path.exists():
+            print(f"Input file not found: {input_path}", file=sys.stderr)
+            return 2
+
         return run_scan(
             input_path=input_path,
             output_dir=output_dir,
             timeout=args.timeout,
             pause_seconds=args.pause,
+            decrypt_key=args.decrypt_key,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
