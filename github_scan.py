@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import csv
 import hashlib
 import hmac
@@ -20,6 +21,41 @@ from urllib import error, parse, request
 API_BASE = "https://api.github.com"
 ENC_MAGIC = "GITHUB_SCAN_ENC_V1"
 PBKDF2_ITERATIONS = 200_000
+CONFIG_FILE = "scan_config.ini"
+
+# Valid affiliation tokens accepted by the GitHub API.
+_VALID_AFFILIATIONS = {"owner", "collaborator", "organization_member"}
+
+
+def load_config(config_path: str = CONFIG_FILE) -> configparser.ConfigParser:
+    """Load scan_config.ini, returning a ConfigParser with built-in defaults."""
+    cfg = configparser.ConfigParser(
+        defaults={
+            "affiliation": "owner",
+            "timeout": "30",
+            "pause": "0.0",
+            "output_dir": "output",
+            "input": "key.csv",
+        }
+    )
+    # Ensure the [scan] section always exists even if the file is missing.
+    cfg.read_dict({"scan": {}})
+    cfg.read(config_path, encoding="utf-8")
+    return cfg
+
+
+def validate_affiliation(raw: str) -> str:
+    """Validate and normalise the affiliation string from config or CLI."""
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    invalid = [t for t in tokens if t not in _VALID_AFFILIATIONS]
+    if invalid:
+        raise ValueError(
+            f"Invalid affiliation value(s): {invalid}. "
+            f"Allowed values: {sorted(_VALID_AFFILIATIONS)}"
+        )
+    if not tokens:
+        raise ValueError("affiliation must not be empty.")
+    return ",".join(tokens)
 TECH_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("django", "Django"),
     ("fastapi", "FastAPI"),
@@ -407,7 +443,16 @@ def get_authenticated_login(token: str, timeout: int) -> str:
     return str(login)
 
 
-def fetch_owned_repos(token: str, timeout: int) -> list[dict[str, Any]]:
+def fetch_owned_repos(token: str, timeout: int, affiliation: str = "owner") -> list[dict[str, Any]]:
+    """Fetch repositories for the authenticated user.
+
+    Args:
+        token:       GitHub personal access token.
+        timeout:     HTTP request timeout in seconds.
+        affiliation: Comma-separated GitHub affiliation scope.
+                     Supported values: owner, collaborator, organization_member.
+                     Defaults to 'owner' (personal repos only).
+    """
     repos: list[dict[str, Any]] = []
     page = 1
 
@@ -417,7 +462,7 @@ def fetch_owned_repos(token: str, timeout: int) -> list[dict[str, Any]]:
                 "per_page": 100,
                 "page": page,
                 "visibility": "all",
-                "affiliation": "owner",
+                "affiliation": affiliation,
                 "sort": "full_name",
                 "direction": "asc",
             }
@@ -446,12 +491,19 @@ def sanitize_repo(
 ) -> dict[str, Any]:
     owner_obj = repo.get("owner") if isinstance(repo.get("owner"), dict) else {}
     tags = build_tags(technologies)
+    repo_owner_login = str(owner_obj.get("login") or "")
+    # Detect if this is an org / forked repo (owner != the authenticated user scanning it).
+    is_org_repo = bool(authenticated_login and repo_owner_login and
+                       repo_owner_login.lower() != authenticated_login.lower())
     return {
         "csv_owner": csv_owner,
         "authenticated_login": authenticated_login,
         "repo_name": repo.get("name"),
         "full_name": repo.get("full_name"),
-        "owner_login": owner_obj.get("login"),
+        "owner_login": repo_owner_login,
+        "org_repo": is_org_repo,
+        # members is a list that will be merged during deduplication
+        "members": [authenticated_login] if authenticated_login else ([csv_owner] if csv_owner else []),
         "private": bool(repo.get("private", False)),
         "html_url": repo.get("html_url"),
         "description": repo.get("description") or "",
@@ -474,41 +526,81 @@ def md_cell(value: Any) -> str:
     return text.replace("|", "\\|")
 
 
+def deduplicate_repos(all_repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge duplicate repos (same full_name) that appear across multiple accounts.
+
+    Org repos are often accessible by several members.  This function collapses
+    them into a single canonical entry and records every member that had access
+    in the 'members' list.  The first occurrence wins for all data fields.
+    """
+    seen: dict[str, dict[str, Any]] = {}  # full_name -> merged entry
+    ordered_keys: list[str] = []          # preserve insertion order
+
+    for repo in all_repos:
+        full_name = str(repo.get("full_name") or "")
+        if not full_name:
+            # No full_name — cannot deduplicate, keep as-is.
+            ordered_keys.append(f"__no_full_name_{id(repo)}")
+            seen[ordered_keys[-1]] = repo
+            continue
+
+        if full_name not in seen:
+            seen[full_name] = dict(repo)  # clone so we don't mutate originals
+            seen[full_name]["members"] = list(repo.get("members") or [])
+            ordered_keys.append(full_name)
+        else:
+            # Merge: add any new members not already listed.
+            existing_members: list[str] = seen[full_name]["members"]
+            for member in (repo.get("members") or []):
+                if member and member not in existing_members:
+                    existing_members.append(member)
+
+    return [seen[k] for k in ordered_keys]
+
+
 def write_project_summaries(all_repos: list[dict[str, Any]], output_dir: Path) -> None:
+    """Write the cross-account project-summaries.md.
+
+    Uses the deduplicated repo list so org repos appear only once.
+    The 'Members' column shows every account that has access.
+    """
     summary_lines: list[str] = [
         "# Project Summaries",
         "",
         f"Generated at (UTC): `{utc_now_iso()}`",
         "",
-        "| Owner | Repository | Technologies | Tags | Summary | URL |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Owner | Repository | Members | Technologies | Tags | Summary | URL |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
 
     sorted_repos = sorted(
         all_repos,
         key=lambda row: (
-            str(row.get("authenticated_login") or row.get("csv_owner") or "").lower(),
+            str(row.get("owner_login") or row.get("authenticated_login") or row.get("csv_owner") or "").lower(),
             str(row.get("repo_name") or "").lower(),
         ),
     )
 
     for repo in sorted_repos:
-        owner = md_cell(repo.get("authenticated_login") or repo.get("csv_owner") or "")
+        owner = md_cell(repo.get("owner_login") or repo.get("authenticated_login") or repo.get("csv_owner") or "")
         repo_name = md_cell(repo.get("repo_name", ""))
+        members_list = repo.get("members") or []
+        members = md_cell(", ".join([str(m) for m in members_list if m]))
         technologies = md_cell(", ".join([str(item) for item in repo.get("technologies", []) if item]) or "")
         tags = md_cell(" ".join([str(item) for item in repo.get("tags", []) if item]) or "")
         summary = md_cell(repo.get("readme_summary", ""))
         url = md_cell(repo.get("html_url", ""))
-        summary_lines.append(f"| {owner} | {repo_name} | {technologies} | {tags} | {summary} | {url} |")
+        summary_lines.append(f"| {owner} | {repo_name} | {members} | {technologies} | {tags} | {summary} | {url} |")
 
     summary_path = output_dir / "project-summaries.md"
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
 
 
-def to_markdown_table_rows(repos: list[dict[str, Any]]) -> list[str]:
+def to_markdown_table_rows(repos: list[dict[str, Any]], include_members: bool = False) -> list[str]:
     lines: list[str] = []
     for repo in repos:
         visibility = "Private" if repo["private"] else "Public"
+        is_org = "✓" if repo.get("org_repo") else "-"
         name = md_cell(repo.get("repo_name", ""))
         language = md_cell(repo.get("language", ""))
         technologies = md_cell(", ".join([str(item) for item in repo.get("technologies", []) if item]) or "")
@@ -518,22 +610,40 @@ def to_markdown_table_rows(repos: list[dict[str, Any]]) -> list[str]:
         forks = str(repo.get("forks_count", 0))
         updated = md_cell(repo.get("updated_at", ""))
         url = md_cell(repo.get("html_url", ""))
-        lines.append(
-            f"| {name} | {visibility} | {language} | {technologies} | {tags} | {summary} | {stars} | {forks} | {updated} | {url} |"
-        )
+        
+        row = f"| {name} | {is_org} | {visibility} | {language} | {technologies} | {tags} | {summary} | {stars} | {forks} | {updated} | {url} |"
+        if include_members:
+            members_list = repo.get("members") or []
+            members = md_cell(", ".join([str(m) for m in members_list if m]))
+            row = f"| {name} | {is_org} | {members} | {visibility} | {language} | {technologies} | {tags} | {summary} | {stars} | {forks} | {updated} | {url} |"
+        
+        lines.append(row)
     return lines
 
 
-def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Path) -> None:
+def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Path, deduplicate: bool = True) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_repos: list[dict[str, Any]] = []
+    # Raw flat list — every account's repos including org-repo duplicates.
+    all_repos_raw: list[dict[str, Any]] = []
     for result in results:
-        all_repos.extend(result.repos)
+        all_repos_raw.extend(result.repos)
+
+    # Deduplicated list used for cross-account outputs.
+    all_repos = deduplicate_repos(all_repos_raw) if deduplicate else all_repos_raw
+    org_repo_count = sum(1 for r in all_repos if r.get("org_repo"))
+    dup_removed = len(all_repos_raw) - len(all_repos)
 
     json_payload = {
         "generated_at_utc": utc_now_iso(),
         "input_file": str(input_path),
+        "deduplication": {
+            "enabled": deduplicate,
+            "raw_repo_count": len(all_repos_raw),
+            "unique_repo_count": len(all_repos),
+            "duplicates_removed": dup_removed,
+            "org_repos": org_repo_count,
+        },
         "accounts": [
             {
                 "csv_owner": item.csv_owner,
@@ -552,11 +662,11 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
 
     csv_path = output_dir / "repositories.csv"
     headers = [
-        "csv_owner",
-        "authenticated_login",
         "repo_name",
         "full_name",
         "owner_login",
+        "org_repo",
+        "members",
         "private",
         "html_url",
         "description",
@@ -571,10 +681,11 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
         "updated_at",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=headers)
+        writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
         writer.writeheader()
         for row in all_repos:
             csv_row = dict(row)
+            csv_row["members"] = ", ".join([str(m) for m in row.get("members", []) if m])
             csv_row["languages"] = "; ".join([str(item) for item in row.get("languages", []) if item])
             csv_row["technologies"] = "; ".join([str(item) for item in row.get("technologies", []) if item])
             csv_row["tags"] = "; ".join([str(item) for item in row.get("tags", []) if item])
@@ -603,38 +714,49 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
             f"| {account.csv_owner} | {account.authenticated_login or '-'} | {account.repo_count} | {status} |"
         )
 
-    report_lines.extend(["", "## Repositories By Account", ""])
+    report_lines.extend(["", "## Master Repository Inventory", ""])
+    
+    if deduplicate:
+        report_lines.append(f"> **Deduplication Info**: Found {len(all_repos_raw)} results across all accounts. "
+                          f"The table below shows the {len(all_repos)} unique repositories found. "
+                          f"The 'Members' column shows which account(s) have access.")
+    else:
+        report_lines.append("> **Deduplication Disabled**: All results are listed as-is.")
 
-    for account in results:
-        title = account.authenticated_login or account.csv_owner
-        report_lines.append(f"### {title}")
-        report_lines.append("")
-
-        if account.error:
-            report_lines.append(f"Scan failed: `{account.error}`")
-            report_lines.append("")
-            continue
-
-        if not account.repos:
-            report_lines.append("No repositories found.")
-            report_lines.append("")
-            continue
-
-        report_lines.extend(
-            [
-                "| Name | Visibility | Primary Language | Technologies | Tags | README Summary | Stars | Forks | Updated At | URL |",
-                "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
-            ]
-        )
-        report_lines.extend(to_markdown_table_rows(account.repos))
-        report_lines.append("")
+    report_lines.append("")
+    report_lines.extend(
+        [
+            "| Name | Org Repo | Members | Visibility | Primary Language | Technologies | Tags | README Summary | Stars | Forks | Updated At | URL |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
+        ]
+    )
+    
+    # Sort Master inventory by owner_login then name
+    sorted_inventory = sorted(
+        all_repos,
+        key=lambda r: (str(r.get("owner_login") or "").lower(), str(r.get("repo_name") or "").lower())
+    )
+    
+    report_lines.extend(to_markdown_table_rows(sorted_inventory, include_members=True))
+    report_lines.append("")
 
     report_path = output_dir / "repository-report.md"
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
     write_project_summaries(all_repos, output_dir)
 
+    if deduplicate and dup_removed > 0:
+        print(f"  Deduplication: {len(all_repos_raw)} raw entries -> {len(all_repos)} unique repos ({dup_removed} duplicates removed).")
 
-def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: float, decrypt_key: str | None) -> int:
+
+def run_scan(
+    input_path: Path,
+    output_dir: Path,
+    timeout: int,
+    pause_seconds: float,
+    decrypt_key: str | None,
+    affiliation: str = "owner",
+    deduplicate: bool = True,
+) -> int:
     credentials = load_credentials(input_path, decrypt_key)
     results: list[AccountResult] = []
 
@@ -651,7 +773,7 @@ def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: fl
             if auth_login.lower() != csv_owner.lower():
                 warnings.append(f"CSV owner '{csv_owner}' differs from authenticated login '{auth_login}'.")
 
-            raw_repos = fetch_owned_repos(token, timeout)
+            raw_repos = fetch_owned_repos(token, timeout, affiliation=affiliation)
             enrich_failures = 0
             for repo in raw_repos:
                 languages_by_bytes: dict[str, int] = {}
@@ -706,7 +828,7 @@ def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: fl
         if pause_seconds > 0 and index < len(credentials):
             time.sleep(pause_seconds)
 
-    write_outputs(results, output_dir, input_path)
+    write_outputs(results, output_dir, input_path, deduplicate=deduplicate)
 
     total_repos = sum(item.repo_count for item in results)
     failed_accounts = sum(1 for item in results if item.error)
@@ -718,16 +840,46 @@ def run_scan(input_path: Path, output_dir: Path, timeout: int, pause_seconds: fl
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan GitHub repositories for accounts listed in a CSV file and generate documentation outputs."
+        description=(
+            "Scan GitHub repositories for accounts listed in a CSV file and "
+            "generate documentation outputs. "
+            f"Default values are read from '{CONFIG_FILE}' when present; "
+            "CLI flags always take precedence."
+        )
     )
-    parser.add_argument("--input", default="key.csv", help="Path to input CSV containing username,token rows.")
-    parser.add_argument("--output-dir", default="output", help="Directory for generated output files.")
-    parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
+    parser.add_argument(
+        "--config",
+        default=CONFIG_FILE,
+        help=f"Path to INI config file (default: {CONFIG_FILE}).",
+    )
+    parser.add_argument("--input", default=None, help="Path to input CSV containing username,token rows.")
+    parser.add_argument("--output-dir", default=None, help="Directory for generated output files.")
+    parser.add_argument("--timeout", type=int, default=None, help="HTTP timeout in seconds.")
     parser.add_argument(
         "--pause",
         type=float,
-        default=0.0,
+        default=None,
         help="Delay in seconds between scanning each account.",
+    )
+    parser.add_argument(
+        "--affiliation",
+        default=None,
+        help=(
+            "Comma-separated GitHub repo affiliation scope. "
+            "Allowed values: owner, collaborator, organization_member. "
+            "Example: --affiliation owner,organization_member"
+        ),
+    )
+    parser.add_argument(
+        "--no-deduplicate",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable cross-account deduplication of org repos. "
+            "By default, repos shared across multiple accounts (e.g. org repos) "
+            "appear once in CSV/JSON/project-summaries with all members listed. "
+            "Use this flag to revert to the raw per-account output."
+        ),
     )
     parser.add_argument("--decrypt-key", default=None, help="Decrypt key for encrypted key file input.")
     parser.add_argument("--encrypt-key", default=None, help="User-defined key used to encrypt key file.")
@@ -751,10 +903,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    input_path = Path(args.input)
-    output_dir = Path(args.output_dir)
+
+    # ------------------------------------------------------------------
+    # Load config file, then let explicit CLI flags override each value.
+    # ------------------------------------------------------------------
+    cfg = load_config(args.config)
+    section = "scan"
+
+    resolved_input = args.input or cfg.get(section, "input")
+    resolved_output_dir = args.output_dir or cfg.get(section, "output_dir")
+    resolved_timeout = args.timeout if args.timeout is not None else cfg.getint(section, "timeout")
+    resolved_pause = args.pause if args.pause is not None else cfg.getfloat(section, "pause")
+    raw_affiliation = args.affiliation or cfg.get(section, "affiliation")
+    resolved_deduplicate = cfg.getboolean(section, "deduplicate") if not args.no_deduplicate else False
+
+    input_path = Path(resolved_input)
+    output_dir = Path(resolved_output_dir)
 
     try:
+        affiliation = validate_affiliation(raw_affiliation)
+
         if args.encrypt_input:
             if not args.encrypt_key:
                 raise ValueError("--encrypt-input requires --encrypt-key.")
@@ -774,12 +942,16 @@ def main() -> int:
             print(f"Input file not found: {input_path}", file=sys.stderr)
             return 2
 
+        print(f"Config: {args.config} | affiliation={affiliation} | timeout={resolved_timeout}s | pause={resolved_pause}s | deduplicate={resolved_deduplicate}")
+
         return run_scan(
             input_path=input_path,
             output_dir=output_dir,
-            timeout=args.timeout,
-            pause_seconds=args.pause,
+            timeout=resolved_timeout,
+            pause_seconds=resolved_pause,
             decrypt_key=args.decrypt_key,
+            affiliation=affiliation,
+            deduplicate=resolved_deduplicate,
         )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
