@@ -42,13 +42,13 @@ python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret
 ### 2) Scan using encrypted key file 🛡️
 
 ```powershell
-python github_scan.py --input key.csv.enc --decrypt-key "your-secret-string" --output-dir output
+python github_scan.py --input keys.enc --decrypt-key "your-secret-string" --output-dir output
 ```
 
 ### 3) Export decrypted file (optional) 📤
 
 ```powershell
-python github_scan.py --input key.csv.enc --decrypt-key "your-secret-string" --export-decrypted key.decrypted.csv
+python github_scan.py --input keys.enc --decrypt-key "your-secret-string" --export-decrypted key.decrypted.csv
 ```
 
 ## Create Personal Access Tokens (Classic)

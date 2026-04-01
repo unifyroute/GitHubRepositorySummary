@@ -86,6 +86,8 @@ class AccountResult:
     csv_owner: str
     authenticated_login: str | None
     repo_count: int
+    personal_repo_count: int
+    org_repo_count: int
     repos: list[dict[str, Any]]
     warnings: list[str]
     error: str | None
@@ -511,6 +513,7 @@ def sanitize_repo(
         "languages": [key for key, _ in sorted(languages_by_bytes.items(), key=lambda item: item[1], reverse=True)],
         "technologies": technologies,
         "tags": tags,
+        "topics": repo.get("topics") or [],
         "readme_summary": readme_summary,
         "default_branch": repo.get("default_branch") or "",
         "stargazers_count": int(repo.get("stargazers_count", 0) or 0),
@@ -558,67 +561,63 @@ def deduplicate_repos(all_repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [seen[k] for k in ordered_keys]
 
 
-def write_project_summaries(all_repos: list[dict[str, Any]], output_dir: Path) -> None:
+def write_project_summaries(all_repos: list[dict[str, Any]], output_dir: Path, scanned_users: set[str] | None = None) -> None:
     """Write the cross-account project-summaries.md.
 
     Uses the deduplicated repo list so org repos appear only once.
-    The 'Members' column shows every account that has access.
+    Categorizes into Org and User sections.
     """
     summary_lines: list[str] = [
         "# Project Summaries",
         "",
         f"Generated at (UTC): `{utc_now_iso()}`",
         "",
-        "| Owner | Repository | Members | Technologies | Tags | Summary | URL |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
 
-    sorted_repos = sorted(
-        all_repos,
-        key=lambda row: (
-            str(row.get("owner_login") or row.get("authenticated_login") or row.get("csv_owner") or "").lower(),
-            str(row.get("repo_name") or "").lower(),
-        ),
-    )
+    if scanned_users is None:
+        scanned_users = set()
 
-    for repo in sorted_repos:
-        owner = md_cell(repo.get("owner_login") or repo.get("authenticated_login") or repo.get("csv_owner") or "")
-        repo_name = md_cell(repo.get("repo_name", ""))
-        members_list = repo.get("members") or []
-        members = md_cell(", ".join([str(m) for m in members_list if m]))
-        technologies = md_cell(", ".join([str(item) for item in repo.get("technologies", []) if item]) or "")
-        tags = md_cell(" ".join([str(item) for item in repo.get("tags", []) if item]) or "")
-        summary = md_cell(repo.get("readme_summary", ""))
-        url = md_cell(repo.get("html_url", ""))
-        summary_lines.append(f"| {owner} | {repo_name} | {members} | {technologies} | {tags} | {summary} | {url} |")
+    org_repos = [r for r in all_repos if (r.get("owner_login") or "").lower() not in scanned_users]
+    user_repos = [r for r in all_repos if (r.get("owner_login") or "").lower() in scanned_users]
+
+    def add_table(repos: list[dict[str, Any]], title: str):
+        if not repos:
+            return
+        summary_lines.extend([f"## {title}", ""])
+        summary_lines.extend(
+            [
+                "| Owner | Repository | Members | Technologies | Tags | Description | Summary | Topics |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        sorted_repos = sorted(
+            repos,
+            key=lambda row: (
+                str(row.get("owner_login") or row.get("authenticated_login") or row.get("csv_owner") or "").lower(),
+                str(row.get("repo_name") or "").lower(),
+            ),
+        )
+        for repo in sorted_repos:
+            owner = md_cell(repo.get("owner_login") or repo.get("authenticated_login") or repo.get("csv_owner") or "")
+            repo_name = md_cell(repo.get("repo_name", ""))
+            members_list = repo.get("members") or []
+            members = md_cell(", ".join([str(m) for m in members_list if m]))
+            technologies = md_cell(", ".join([str(item) for item in repo.get("technologies", []) if item]) or "")
+            tags = md_cell(" ".join([str(item) for item in repo.get("tags", []) if item]) or "")
+            description = md_cell(repo.get("description", ""))
+            summary = md_cell(repo.get("readme_summary", ""))
+            topics = md_cell(", ".join([str(t) for t in repo.get("topics", []) if t]) or "")
+            summary_lines.append(f"| {owner} | {repo_name} | {members} | {technologies} | {tags} | {description} | {summary} | {topics} |")
+        summary_lines.append("")
+
+    add_table(org_repos, "Org Repos")
+    add_table(user_repos, "User Repos")
 
     summary_path = output_dir / "project-summaries.md"
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
 
 
-def to_markdown_table_rows(repos: list[dict[str, Any]], include_members: bool = False) -> list[str]:
-    lines: list[str] = []
-    for repo in repos:
-        visibility = "Private" if repo["private"] else "Public"
-        is_org = "✓" if repo.get("org_repo") else "-"
-        name = md_cell(repo.get("repo_name", ""))
-        language = md_cell(repo.get("language", ""))
-        technologies = md_cell(", ".join([str(item) for item in repo.get("technologies", []) if item]) or "")
-        tags = md_cell(" ".join([str(item) for item in repo.get("tags", []) if item]) or "")
-        summary = md_cell(repo.get("readme_summary", ""))
-        stars = str(repo.get("stargazers_count", 0))
-        forks = str(repo.get("forks_count", 0))
-        updated = md_cell(repo.get("updated_at", ""))
-        url = md_cell(repo.get("html_url", ""))
-        
-        row = f"| {name} | {is_org} | {visibility} | {language} | {technologies} | {tags} | {summary} | {stars} | {forks} | {updated} | {url} |"
-        if include_members:
-            members_list = repo.get("members") or []
-            members = md_cell(", ".join([str(m) for m in members_list if m]))
-            row = f"| {name} | {is_org} | {members} | {visibility} | {language} | {technologies} | {tags} | {summary} | {stars} | {forks} | {updated} | {url} |"
-        
-        lines.append(row)
-    return lines
+
 
 
 def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Path, deduplicate: bool = True) -> None:
@@ -649,6 +648,8 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
                 "csv_owner": item.csv_owner,
                 "authenticated_login": item.authenticated_login,
                 "repo_count": item.repo_count,
+                "personal_repo_count": item.personal_repo_count,
+                "org_repo_count": item.org_repo_count,
                 "warnings": item.warnings,
                 "error": item.error,
             }
@@ -699,8 +700,8 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
         "",
         "## Account Summary",
         "",
-        "| CSV Owner | Authenticated Login | Repositories | Status |",
-        "| --- | --- | ---: | --- |",
+        "| Owner | Login | Personal | Org | Total | Status |",
+        "| --- | --- | ---: | ---: | ---: | --- |",
     ]
 
     for account in results:
@@ -711,38 +712,120 @@ def write_outputs(results: list[AccountResult], output_dir: Path, input_path: Pa
             status = "WARNING: " + "; ".join(account.warnings)
 
         report_lines.append(
-            f"| {account.csv_owner} | {account.authenticated_login or '-'} | {account.repo_count} | {status} |"
+            f"| {account.csv_owner} | {account.authenticated_login or '-'} | "
+            f"{account.personal_repo_count} | {account.org_repo_count} | {account.repo_count} | {status} |"
         )
 
-    report_lines.extend(["", "## Master Repository Inventory", ""])
-    
-    if deduplicate:
-        report_lines.append(f"> **Deduplication Info**: Found {len(all_repos_raw)} results across all accounts. "
-                          f"The table below shows the {len(all_repos)} unique repositories found. "
-                          f"The 'Members' column shows which account(s) have access.")
-    else:
-        report_lines.append("> **Deduplication Disabled**: All results are listed as-is.")
+    # Scanned users identification for robust categorization
+    scanned_users = {a.authenticated_login.lower() for a in results if a.authenticated_login}
+    user_repos_all = [r for r in all_repos if (r.get("owner_login") or "").lower() in scanned_users]
+    org_repos_all = [r for r in all_repos if (r.get("owner_login") or "").lower() not in scanned_users]
 
-    report_lines.append("")
-    report_lines.extend(
-        [
-            "| Name | Org Repo | Members | Visibility | Primary Language | Technologies | Tags | README Summary | Stars | Forks | Updated At | URL |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- | ---: | ---: | --- | --- |",
-        ]
-    )
+    # --- User Repos Section ---
+    report_lines.extend(["", "## User Repos", ""])
+    if deduplicate:
+        report_lines.append("> **Deduplication Info**: Org repositories shared with these accounts are listed in the Organization sections below.")
     
-    # Sort Master inventory by owner_login then name
-    sorted_inventory = sorted(
-        all_repos,
-        key=lambda r: (str(r.get("owner_login") or "").lower(), str(r.get("repo_name") or "").lower())
-    )
+    # Track which user repos we've already listed (in case of overlaps, though usually user repos are unique to one account)
+    listed_user_repos: set[str] = set()
+
+    for account in results:
+        if not account.authenticated_login:
+            continue
+        
+        login_lower = account.authenticated_login.lower()
+        # Find repos owned by this specific user
+        owner_repos = [r for r in user_repos_all if (r.get("owner_login") or "").lower() == login_lower]
+        
+        if owner_repos:
+            owner_repos_sorted = sorted(owner_repos, key=lambda r: str(r.get("repo_name") or "").lower())
+            report_lines.extend(["", f"### User: {account.authenticated_login}", ""])
+            report_lines.extend(
+                [
+                    "| Name | Owner | Visibility | Primary Language | Technologies | Description | README Summary | Updated At |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+            for r in owner_repos_sorted:
+                name = md_cell(r.get("repo_name", ""))
+                owner = md_cell(r.get("owner_login") or "")
+                visibility = "Private" if r.get("private") else "Public"
+                lang = md_cell(r.get("language") or "")
+                tech = md_cell(", ".join([str(item) for item in r.get("technologies", []) if item]))
+                desc = md_cell(r.get("description") or "")
+                summary = md_cell(r.get("readme_summary") or "")
+                updated = md_cell(r.get("updated_at") or "")
+                report_lines.append(f"| {name} | {owner} | {visibility} | {lang} | {tech} | {desc} | {summary} | {updated} |")
+                listed_user_repos.add(str(r.get("full_name") or ""))
+
+    # --- Organization Summary Section ---
+    report_lines.extend(["", "## Organization Summary", ""])
     
-    report_lines.extend(to_markdown_table_rows(sorted_inventory, include_members=True))
-    report_lines.append("")
+    if org_repos_all:
+        report_lines.extend(
+            [
+                "| Organization | Rep Count | Members |",
+                "| --- | ---: | --- |",
+            ]
+        )
+        # Group by organization
+        by_org: dict[str, dict[str, Any]] = {}
+        for r in org_repos_all:
+            org = str(r.get("owner_login") or "").lower()
+            if org not in by_org:
+                by_org[org] = {"count": 0, "members": set()}
+            by_org[org]["count"] += 1
+            for m in (r.get("members") or []):
+                if m:
+                    by_org[org]["members"].add(str(m))
+
+        sorted_orgs = sorted(by_org.keys())
+        for org in sorted_orgs:
+            count = by_org[org]["count"]
+            members = md_cell(", ".join(sorted(by_org[org]["members"])))
+            report_lines.append(f"| {org} | {count} | {members} |")
+        report_lines.append("")
+
+        # --- Org Repo Details Section ---
+        report_lines.extend(["## Org Repo Details", ""])
+        
+        if deduplicate:
+            report_lines.append(f"> **Deduplication Info**: Found {len(all_repos_raw)} results across all accounts. "
+                              f"The tables below show unique repositories found.")
+        
+        # Group org repos for detailed display
+        org_repo_groups: dict[str, list[dict[str, Any]]] = {}
+        for r in org_repos_all:
+            org = str(r.get("owner_login") or "").lower()
+            if org not in org_repo_groups:
+                org_repo_groups[org] = []
+            org_repo_groups[org].append(r)
+        
+        for org in sorted_orgs:
+            repos_in_org = sorted(org_repo_groups[org], key=lambda r: str(r.get("repo_name") or "").lower())
+            report_lines.extend(["", f"### Organization: {org}", ""])
+            report_lines.extend(
+                [
+                    "| Name | Members | Visibility | Primary Language | Technologies | Description | README Summary | Updated At |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+            for r in repos_in_org:
+                name = md_cell(r.get("repo_name", ""))
+                members_list = r.get("members") or []
+                members = md_cell(", ".join([str(m) for m in members_list if m]))
+                visibility = "Private" if r.get("private") else "Public"
+                lang = md_cell(r.get("language") or "")
+                tech = md_cell(", ".join([str(item) for item in r.get("technologies", []) if item]))
+                desc = md_cell(r.get("description") or "")
+                summary = md_cell(r.get("readme_summary") or "")
+                updated = md_cell(r.get("updated_at") or "")
+                report_lines.append(f"| {name} | {members} | {visibility} | {lang} | {tech} | {desc} | {summary} | {updated} |")
+            report_lines.append("")
 
     report_path = output_dir / "repository-report.md"
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
-    write_project_summaries(all_repos, output_dir)
+    write_project_summaries(all_repos, output_dir, scanned_users=scanned_users)
 
     if deduplicate and dup_removed > 0:
         print(f"  Deduplication: {len(all_repos_raw)} raw entries -> {len(all_repos)} unique repos ({dup_removed} duplicates removed).")
@@ -814,11 +897,16 @@ def run_scan(
             account_error = str(exc)
             print(f"  Failed: {account_error}")
 
+        personal_count = sum(1 for r in account_repos if not r.get("org_repo"))
+        org_count = sum(1 for r in account_repos if r.get("org_repo"))
+
         results.append(
             AccountResult(
                 csv_owner=csv_owner,
                 authenticated_login=auth_login,
                 repo_count=len(account_repos),
+                personal_repo_count=personal_count,
+                org_repo_count=org_count,
                 repos=account_repos,
                 warnings=warnings,
                 error=account_error,
@@ -831,8 +919,10 @@ def run_scan(
     write_outputs(results, output_dir, input_path, deduplicate=deduplicate)
 
     total_repos = sum(item.repo_count for item in results)
+    total_personal = sum(item.personal_repo_count for item in results)
+    total_org = sum(item.org_repo_count for item in results)
     failed_accounts = sum(1 for item in results if item.error)
-    print(f"Completed. Accounts: {len(results)}, Repositories: {total_repos}, Failures: {failed_accounts}")
+    print(f"Completed. Accounts: {len(results)}, Repositories: {total_repos} (Personal: {total_personal}, Org: {total_org}), Failures: {failed_accounts}")
     print(f"Output directory: {output_dir}")
 
     return 0 if failed_accounts == 0 else 1
