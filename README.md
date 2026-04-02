@@ -15,6 +15,7 @@ This script reads account credentials from `key.csv`, calls the GitHub API for e
 - Capture technologies used in each repo
 - Extract README-based project summaries
 - Generate JSON, CSV, and Markdown reports
+- Generate a beautiful HTML dashboard containing detailed readmes and commit histories
 - Support encrypted key files for safer token handling
 
 ## Secure Key File (Encrypt/Decrypt) 🔐
@@ -107,6 +108,16 @@ python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret
 python github_scan.py --help
 ```
 
+### G) Generate an HTML Dashboard
+
+```powershell
+python generate_dashboard.py --input key.csv --output-dir output
+```
+If using an encrypted key file:
+```powershell
+python generate_dashboard.py --input keys.enc --decrypt-key "your-secret-string"
+```
+
 ## Input Format 📝
 
 `key.csv` must contain one account per line:
@@ -131,6 +142,10 @@ Running the scanner creates files under `output/`:
 - `output/repository-report.md`: human-readable inventory report with technologies and README summaries
 - `output/project-summaries.md`: compact summary table (`owner`, `repo`, `technologies`, `tags`, `summary`, `url`)
 
+Running `generate_dashboard.py` creates:
+- `output/index.html`: A premium dark-mode dashboard card listing for all repositories.
+- `output/repos/*.html`: Detailed subpages for each repository containing the full rendered README, commit counts, and a complete commit trace.
+
 Each repository now includes:
 
 - `language`: GitHub primary language
@@ -154,6 +169,19 @@ Optional arguments:
 - `--encrypt-key "..."` user-defined key for encryption
 - `--encrypted-output path` custom output path for encrypted file
 - `--export-decrypted path` export decrypted key file and exit
+
+### Dashboard Generator ▶️
+
+```powershell
+python generate_dashboard.py --input key.csv --output-dir output
+```
+
+Optional arguments for `generate_dashboard.py`:
+
+- `--config scan_config.ini` path to INI config file
+- `--input key.csv` path to plain or encrypted input CSV
+- `--output-dir output` directory for generated HTML files
+- `--decrypt-key "..."` decrypt key for encrypted key file input
 
 ## Notes 📌
 
