@@ -7,7 +7,7 @@
 
 Scan all your GitHub repositories at once and generate a clean summary for each project in one run. 📦
 
-This script reads account credentials from `key.csv`, calls the GitHub API for each account's owned repositories, and produces documentation-ready output files.
+This script reads account credentials from `keys.csv`, calls the GitHub API for each account's owned repositories, and produces documentation-ready output files.
 
 ## Why This Project? ✨
 
@@ -26,18 +26,18 @@ You can encrypt your key file using a user-defined string so tokens are not stor
 - If `--decrypt-key` is missing or incorrect, the script exits with an error.
 - You can export a decrypted file when needed.
 
-### 1) Encrypt plain `key.csv` 🧩
+### 1) Encrypt plain `keys.csv` 🧩
 
 ```powershell
-python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret-string"
+python github_scan.py --input keys.csv --encrypt-input --encrypt-key "your-secret-string"
 ```
 
-Default encrypted output: `key.csv.enc`
+Default encrypted output: `keys.enc`
 
 Custom encrypted output path:
 
 ```powershell
-python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret-string" --encrypted-output secure\my-keys.enc
+python github_scan.py --input keys.csv --encrypt-input --encrypt-key "your-secret-string" --encrypted-output secure\my-keys.enc
 ```
 
 ### 2) Scan using encrypted key file 🛡️
@@ -65,41 +65,41 @@ Create one token per GitHub account and grant only `repo` scope.
 7. Set a note and expiration as needed.
 8. Under scopes, select only `repo`.
 9. Click `Generate token` and copy it immediately.
-10. Add it to `key.csv` as `username,token`.
+10. Add it to `keys.csv` as `username,token`.
 
 Repeat for each account you want to include in the scan.
 
 ## Quick Examples 🧪
 
-### A) Standard scan using plain `key.csv`
+### A) Standard scan using plain `keys.csv`
 
 ```powershell
-python github_scan.py --input key.csv --output-dir output
+python github_scan.py --input keys.csv --output-dir output
 ```
 
 ### B) Scan with custom timeout and pause
 
 ```powershell
-python github_scan.py --input key.csv --output-dir output --timeout 45 --pause 0.2
+python github_scan.py --input keys.csv --output-dir output --timeout 45 --pause 0.2
 ```
 
 ### C) Encrypt first, then scan with decrypt key
 
 ```powershell
-python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret-string"
-python github_scan.py --input key.csv.enc --decrypt-key "your-secret-string" --output-dir output
+python github_scan.py --input keys.csv --encrypt-input --encrypt-key "your-secret-string"
+python github_scan.py --input keys.enc --decrypt-key "your-secret-string" --output-dir output
 ```
 
 ### D) Export decrypted file only
 
 ```powershell
-python github_scan.py --input key.csv.enc --decrypt-key "your-secret-string" --export-decrypted key.decrypted.csv
+python github_scan.py --input keys.enc --decrypt-key "your-secret-string" --export-decrypted key.decrypted.csv
 ```
 
 ### E) Custom encrypted output path
 
 ```powershell
-python github_scan.py --input key.csv --encrypt-input --encrypt-key "your-secret-string" --encrypted-output secure\my-keys.enc
+python github_scan.py --input keys.csv --encrypt-input --encrypt-key "your-secret-string" --encrypted-output secure\my-keys.enc
 ```
 
 ### F) Show command help
@@ -111,7 +111,7 @@ python github_scan.py --help
 ### G) Generate an HTML Dashboard
 
 ```powershell
-python generate_dashboard.py --input key.csv --output-dir output
+python generate_dashboard.py --input keys.csv --output-dir output
 ```
 If using an encrypted key file:
 ```powershell
@@ -120,7 +120,7 @@ python generate_dashboard.py --input keys.enc --decrypt-key "your-secret-string"
 
 ## Input Format 📝
 
-`key.csv` must contain one account per line:
+`keys.csv` must contain one account per line:
 
 ```csv
 username,github_personal_access_token
@@ -157,7 +157,7 @@ Each repository now includes:
 ## Run ▶️
 
 ```powershell
-python github_scan.py --input key.csv --output-dir output
+python github_scan.py --input keys.csv --output-dir output
 ```
 
 Optional arguments:
@@ -173,13 +173,13 @@ Optional arguments:
 ### Dashboard Generator ▶️
 
 ```powershell
-python generate_dashboard.py --input key.csv --output-dir output
+python generate_dashboard.py --input keys.csv --output-dir output
 ```
 
 Optional arguments for `generate_dashboard.py`:
 
 - `--config scan_config.ini` path to INI config file
-- `--input key.csv` path to plain or encrypted input CSV
+- `--input keys.csv` path to plain or encrypted input CSV
 - `--output-dir output` directory for generated HTML files
 - `--decrypt-key "..."` decrypt key for encrypted key file input
 

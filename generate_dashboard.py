@@ -348,7 +348,7 @@ a.back:hover {{ text-decoration: underline; }}
 </head>
 <body>
 <div class="container">
-    <a href="../index.html" class="back">&larr; Back to Dashboard</a>
+    <a href="../GitHubDashBoard.html" class="back">&larr; Back to Dashboard</a>
     <div class="header-box">
         <h1>{full_name}</h1>
         <p>{desc}</p>
@@ -446,8 +446,8 @@ document.getElementById('searchInput').addEventListener('input', function(e) {{
 </body>
 </html>
 '''
-    (output_dir / "index.html").write_text(dashboard_html, encoding="utf-8")
-    print(f"\nDashboard successfully generated at: {output_dir / 'index.html'}")
+    (output_dir / "GitHubDashBoard.html").write_text(dashboard_html, encoding="utf-8")
+    print(f"\nDashboard successfully generated at: {output_dir / 'GitHubDashBoard.html'}")
 
 
 if __name__ == "__main__":
