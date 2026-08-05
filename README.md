@@ -118,6 +118,20 @@ If using an encrypted key file:
 python generate_dashboard.py --input keys.enc --decrypt-key "your-secret-string"
 ```
 
+### H) Serve the HTML Dashboard
+
+```powershell
+python server.py
+```
+Or with custom port and directory:
+```powershell
+python server.py --port 8080 --dir 20260806
+```
+
+### Quick Commands Reference Sheet
+A compact cheat sheet of all available commands can be found in [commands.md](commands.md).
+
+
 ## Input Format 📝
 
 `keys.csv` must contain one account per line:
@@ -182,6 +196,19 @@ Optional arguments for `generate_dashboard.py`:
 - `--input keys.csv` path to plain or encrypted input CSV
 - `--output-dir output` directory for generated HTML files
 - `--decrypt-key "..."` decrypt key for encrypted key file input
+
+### Dashboard Web Server ▶️
+
+Start the server to view the generated dashboard on your local browser:
+```powershell
+python server.py
+```
+
+Optional arguments for `server.py`:
+
+- `--port PORT` port to run the server on (default: 8000)
+- `--dir DIR` directory containing `GitHubDashBoard.html` (auto-detects date folder or `output` if not provided)
+
 
 ## Notes 📌
 
